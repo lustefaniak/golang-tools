@@ -34,12 +34,19 @@ type Watcher interface {
 // The provided event handler is called sequentially with a batch of file events,
 // but the error handler is called concurrently. The watcher blocks until the
 // handler returns, so the handlers should be fast and non-blocking.
-func New(mode settings.FileWatcherMode, logger *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error)) (Watcher, error) {
+//
+// The optional skipDir, if non-nil, is called with the absolute path of each
+// directory encountered during traversal. If it returns true, that directory
+// and its subtree are skipped. This is applied in addition to the built-in
+// skipDir heuristic, and lets callers honor gopls directory filters to avoid
+// watching irrelevant trees (e.g. node_modules), which can otherwise exhaust
+// file descriptors on systems with low limits.
+func New(mode settings.FileWatcherMode, logger *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error), skipDir func(absPath string) bool) (Watcher, error) {
 	switch mode {
 	case settings.FileWatcherPoll:
-		return NewPollWatcher(logger, onEvents, onError), nil
+		return NewPollWatcher(logger, onEvents, onError, skipDir), nil
 	case settings.FileWatcherFSNotify:
-		return NewFSNotifyWatcher(logger, onEvents, onError)
+		return NewFSNotifyWatcher(logger, onEvents, onError, skipDir)
 	}
 	// TODO(hxjiang): support "auto" mode.
 	return nil, fmt.Errorf("unknown FileWatcher mode: %q", mode)

@@ -46,18 +46,19 @@ Key lessons and design decisions from its implementation:
 // NewPollWatcher creates a new watcher that actively polls the file tree to
 // detect changes. It uses an adaptive back-off strategy to reduce scans of the
 // file tree and save battery; it is thus only eventually consistent.
-func NewPollWatcher(log *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error)) *pollWatcher {
+func NewPollWatcher(log *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error), skipDir func(absPath string) bool) *pollWatcher {
 	if log != nil {
 		log = log.With("watcher", "poll")
 	}
 	w := &pollWatcher{
-		log:      log,
-		onEvents: onEvents,
-		onError:  onError,
-		ctx:      context.Background(),
-		stop:     make(chan struct{}),
-		poke:     make(chan struct{}, 1),
-		roots:    make(map[string]*promise[fileState]),
+		log:         log,
+		onEvents:    onEvents,
+		onError:     onError,
+		skipDirFunc: skipDir,
+		ctx:         context.Background(),
+		stop:        make(chan struct{}),
+		poke:        make(chan struct{}, 1),
+		roots:       make(map[string]*promise[fileState]),
 	}
 	w.loops.Go(w.loop)
 	return w
@@ -75,6 +76,12 @@ type pollWatcher struct {
 	log      *slog.Logger
 	onEvents func([]protocol.FileEvent)
 	onError  func(error)
+
+	// skipDirFunc, if non-nil, is called with the absolute path of a directory
+	// during traversal. If it returns true, the directory and its entire
+	// subtree are skipped. This is checked in addition to the built-in skipDir
+	// function.
+	skipDirFunc func(absPath string) bool
 
 	// TODO(hxjiang): accept ctx from constructor and use ctx.Done() for Close.
 	ctx context.Context
@@ -168,7 +175,7 @@ func (w *pollWatcher) watchDir(dir string) (fileState, error) {
 
 	// Cache miss: perform a synchronous scan to establish a baseline.
 	if err != nil {
-		_, newState, err := scan(dir, nil)
+		_, newState, err := scan(dir, nil, w.skipDirFunc)
 		if err != nil {
 			return nil, err
 		}
@@ -232,7 +239,7 @@ func (w *pollWatcher) loop() {
 					continue // Initial scan failed
 				}
 
-				changes, newState, err := scan(root, p.value)
+				changes, newState, err := scan(root, p.value, w.skipDirFunc)
 				if err != nil {
 					if w.onError != nil {
 						w.onError(err)
@@ -277,7 +284,7 @@ func (w *pollWatcher) loop() {
 //
 // To prevent triggering massive workspace reloads in the LSP, scan explicitly
 // ignores modification time changes on the root directory itself.
-func scan(root string, oldState fileState) ([]protocol.FileEvent, fileState, error) {
+func scan(root string, oldState fileState, skipDirFunc func(absPath string) bool) ([]protocol.FileEvent, fileState, error) {
 	var (
 		newState = make(fileState)
 		events   []protocol.FileEvent
@@ -299,7 +306,7 @@ func scan(root string, oldState fileState) ([]protocol.FileEvent, fileState, err
 			// file is added or removed.
 			return nil
 		}
-		if dirent.IsDir() && skipDir(dirent.Name()) {
+		if dirent.IsDir() && (skipDir(dirent.Name()) || skipDirFunc != nil && skipDirFunc(path)) {
 			return filepath.SkipDir
 		}
 		if !dirent.IsDir() && skipFile(dirent.Name()) {

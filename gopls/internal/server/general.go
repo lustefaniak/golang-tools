@@ -551,7 +551,7 @@ func (s *server) updateServerSideWatcher(ctx context.Context, patterns map[proto
 			event.Error(watcherCtx, "file watcher error", err)
 		}
 
-		w, err := filewatcher.New(wantMode, nil, onChange, onErr)
+		w, err := filewatcher.New(wantMode, nil, onChange, onErr, nil)
 		if err != nil {
 			return err
 		}

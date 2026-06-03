@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -212,7 +213,7 @@ package foo
 						t.Errorf("error from watcher: %v", err)
 					}
 
-					w, err := filewatcher.New(mode, nil, eventsHandler, errHandler)
+					w, err := filewatcher.New(mode, nil, eventsHandler, errHandler, nil)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -341,7 +342,7 @@ func TestBrokenSymlink(t *testing.T) {
 	errHandler := func(err error) {
 		t.Errorf("error from watcher: %v", err)
 	}
-	w, err := filewatcher.New(settings.FileWatcherFSNotify, nil, eventsHandler, errHandler)
+	w, err := filewatcher.New(settings.FileWatcherFSNotify, nil, eventsHandler, errHandler, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +543,7 @@ func TestStress(t *testing.T) {
 
 				t.Errorf("error from watcher: %v", err)
 			}
-			w, err := filewatcher.New(mode, nil, eventsHandler, errHandler)
+			w, err := filewatcher.New(mode, nil, eventsHandler, errHandler, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -585,6 +586,110 @@ func TestStress(t *testing.T) {
 			case <-time.After(30 * time.Second):
 				if len(wants) > 0 {
 					t.Errorf("missing expected events: %#v", moremaps.KeySlice(wants))
+				}
+			}
+		})
+	}
+}
+
+// TestSkipDirFunc verifies that a directory matched by the skipDir predicate
+// passed to New (and its subtree) is excluded from watching, while sibling
+// directories continue to produce events.
+func TestSkipDirFunc(t *testing.T) {
+	switch runtime.GOOS {
+	case "darwin", "linux", "windows":
+	default:
+		t.Skip("unsupported OS")
+	}
+
+	for _, mode := range []settings.FileWatcherMode{settings.FileWatcherFSNotify, settings.FileWatcherPoll} {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+
+			// Create directory structure:
+			//   root/allowed/a.go
+			//   root/skipped/b.go
+			//   root/skipped/sub/c.go
+			for _, p := range []string{"allowed", "skipped", "skipped/sub"} {
+				if err := os.MkdirAll(filepath.Join(root, p), 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, p := range []string{"allowed/a.go", "skipped/b.go", "skipped/sub/c.go"} {
+				if err := os.WriteFile(filepath.Join(root, p), []byte("package x"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			found := make(chan struct{})
+			var (
+				mu   sync.Mutex
+				gots []protocol.FileEvent
+			)
+			// We expect a change event for allowed/a.go but none under skipped/.
+			want := protocol.FileEvent{
+				URI:  protocol.URIFromPath(filepath.Join(root, "allowed", "a.go")),
+				Type: protocol.Changed,
+			}
+			eventsHandler := func(events []protocol.FileEvent) {
+				mu.Lock()
+				gots = append(gots, events...)
+				mu.Unlock()
+				for _, e := range events {
+					if e == want {
+						select {
+						case <-found:
+						default:
+							close(found)
+						}
+						return
+					}
+				}
+			}
+			errHandler := func(err error) {
+				t.Errorf("error from watcher: %v", err)
+			}
+
+			skippedDir := filepath.Join(root, "skipped")
+			skipFunc := func(absPath string) bool {
+				return absPath == skippedDir
+			}
+
+			w, err := filewatcher.New(mode, nil, eventsHandler, errHandler, skipFunc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := w.Close(); err != nil {
+					t.Errorf("failed to close the file watcher: %v", err)
+				}
+			}()
+
+			if err := w.WatchDir(root); err != nil {
+				t.Fatal(err)
+			}
+			w.Poke()
+
+			// Modify both files. Only allowed/a.go should produce an event.
+			if err := os.WriteFile(filepath.Join(root, "skipped", "b.go"), []byte("package modified"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "allowed", "a.go"), []byte("package modified"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			w.Poke()
+
+			select {
+			case <-found:
+			case <-time.After(30 * time.Second):
+				t.Fatalf("timed out waiting for expected event")
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			for _, e := range gots {
+				if strings.Contains(string(e.URI), "skipped") {
+					t.Errorf("received unexpected event for skipped directory: %v", e)
 				}
 			}
 		})

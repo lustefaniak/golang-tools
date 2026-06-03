@@ -23,7 +23,7 @@ import (
 // ErrClosed is used when trying to operate on a closed Watcher.
 var ErrClosed = errors.New("file watcher: watcher already closed")
 
-func NewFSNotifyWatcher(log *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error)) (Watcher, error) {
+func NewFSNotifyWatcher(log *slog.Logger, onEvents func([]protocol.FileEvent), onError func(error), skipDir func(absPath string) bool) (Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -32,13 +32,14 @@ func NewFSNotifyWatcher(log *slog.Logger, onEvents func([]protocol.FileEvent), o
 		log = log.With("watcher", "fsnotify")
 	}
 	w := &fsnotifyWatcher{
-		log:       log,
-		watcher:   watcher,
-		onEvents:  onEvents,
-		onError:   onError,
-		knownDirs: make(map[string]struct{}),
-		stop:      make(chan struct{}),
-		ready:     make(chan struct{}, 1),
+		log:         log,
+		watcher:     watcher,
+		onEvents:    onEvents,
+		onError:     onError,
+		skipDirFunc: skipDir,
+		knownDirs:   make(map[string]struct{}),
+		stop:        make(chan struct{}),
+		ready:       make(chan struct{}, 1),
 	}
 	w.wg.Go(w.run)
 	w.wg.Go(w.process)
@@ -60,6 +61,12 @@ type fsnotifyWatcher struct {
 	onEvents func([]protocol.FileEvent)
 	onError  func(error)
 	// interval time.Duration
+
+	// skipDirFunc, if non-nil, is called with the absolute path of a directory
+	// during traversal. If it returns true, the directory and its entire
+	// subtree are skipped. This is checked in addition to the built-in skipDir
+	// function.
+	skipDirFunc func(absPath string) bool
 
 	stop chan struct{}  // closed by Close to terminate run and process loop
 	wg   sync.WaitGroup // counts the number of active run and process goroutines (max 2)
@@ -281,6 +288,17 @@ func skipDir(dirName string) bool {
 	return strings.HasPrefix(dirName, ".") || strings.HasPrefix(dirName, "_") || dirName == "testdata"
 }
 
+// shouldSkipDir reports whether a directory at the given absolute path should
+// be skipped during traversal. It checks both the built-in skipDir heuristic
+// (by base name) and the optional user-configured skipDirFunc (by absolute
+// path).
+func (w *fsnotifyWatcher) shouldSkipDir(absPath string) bool {
+	if skipDir(filepath.Base(absPath)) {
+		return true
+	}
+	return w.skipDirFunc != nil && w.skipDirFunc(absPath)
+}
+
 // skipFile reports whether the file should be skipped.
 func skipFile(fileName string) bool {
 	switch strings.TrimPrefix(filepath.Ext(fileName), ".") {
@@ -304,7 +322,7 @@ func (w *fsnotifyWatcher) WatchDir(dir string) error {
 			return nil
 		}
 		if dirent.IsDir() {
-			if skipDir(dirent.Name()) {
+			if w.shouldSkipDir(path) {
 				return filepath.SkipDir
 			}
 
@@ -337,7 +355,7 @@ func (w *fsnotifyWatcher) convertEvent(event fsnotify.Event) (_ protocol.FileEve
 	}
 
 	// Filter out events for directories and files that are not of interest.
-	if isDir && skipDir(filepath.Base(event.Name)) {
+	if isDir && w.shouldSkipDir(event.Name) {
 		return protocol.FileEvent{}, true
 	}
 	if !isDir && skipFile(filepath.Base(event.Name)) {
@@ -479,7 +497,7 @@ func (w *fsnotifyWatcher) walkDir(path string, isDir bool, errHandler func(error
 	}
 
 	for _, e := range entries {
-		if e.IsDir() && skipDir(e.Name()) {
+		if e.IsDir() && w.shouldSkipDir(filepath.Join(path, e.Name())) {
 			continue
 		}
 		if !e.IsDir() && skipFile(e.Name()) {
